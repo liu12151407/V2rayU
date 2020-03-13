@@ -19,6 +19,8 @@ extension PreferencePane.Identifier {
     static let advanceTab = Identifier("advanceTab")
     static let subscribeTab = Identifier("subscribeTab")
     static let pacTab = Identifier("pacTab")
+    static let routingTab = Identifier("routingTab")
+    static let dnsTab = Identifier("dnsTab")
     static let aboutTab = Identifier("aboutTab")
 }
 
@@ -28,6 +30,8 @@ let preferencesWindowController = PreferencesWindowController(
             PreferenceAdvanceViewController(),
             PreferenceSubscribeViewController(),
             PreferencePacViewController(),
+            PreferenceRoutingViewController(),
+            PreferenceDnsViewController(),
             PreferenceAboutViewController(),
         ]
 )
@@ -43,6 +47,76 @@ func makeToast(message: String, displayDuration: Double? = 2) {
     toastWindowCtrl.message = message
     toastWindowCtrl.showWindow(Any.self)
     toastWindowCtrl.fadeInHud(displayDuration)
+}
+
+func ToggleRunning(_ toast: Bool = true) {
+    // turn off
+    if UserDefaults.getBool(forKey: .v2rayTurnOn) {
+        menuController.stopV2rayCore()
+        if toast {
+            makeToast(message: "v2ray-core: Off")
+        }
+        return
+    }
+
+    // start
+    menuController.startV2rayCore()
+    if toast {
+        makeToast(message: "v2ray-core: On")
+    }
+}
+
+func SwitchProxyMode() {
+    let runMode = RunMode(rawValue: UserDefaults.get(forKey: .runMode) ?? "manual") ?? .manual
+
+    switch runMode {
+    case .pac:
+        menuController.switchRunMode(runMode: .global)
+        makeToast(message: "V2rayU: global Mode")
+        break
+    case .global:
+        menuController.switchRunMode(runMode: .manual)
+        makeToast(message: "V2rayU: manual Mode")
+        break
+    case .manual:
+        menuController.switchRunMode(runMode: .pac)
+        makeToast(message: "V2rayU: pac Mode")
+        break
+
+    default: break
+    }
+}
+
+// regenerate All Config when base setting changed
+func regenerateAllConfig() {
+    NSLog("regenerateAllConfig.")
+
+    for (idx, item) in V2rayServer.list().enumerated() {
+        if !item.isValid {
+            continue
+        }
+
+        // parse old
+        let vCfg = V2rayConfig()
+        vCfg.parseJson(jsonText: item.json)
+
+        // combine
+        let text = vCfg.combineManual()
+        _ = V2rayServer.save(idx: idx, isValid: vCfg.isValid, jsonData: text)
+
+        print("regenerate config", item.remark)
+    }
+
+    // restart service
+    let item = V2rayServer.loadSelectedItem()
+    if item != nil {
+        menuController.startV2rayCore()
+    }
+
+    // reload config window
+    if menuController.configWindow != nil {
+        menuController.configWindow.serversTableView.reloadData()
+    }
 }
 
 // menu controller
@@ -63,6 +137,9 @@ class MenuController: NSObject, NSMenuDelegate {
 
     // when menu.xib loaded
     override func awakeFromNib() {
+        // windowWillClose Notification
+        NotificationCenter.default.addObserver(self, selector: #selector(configWindowWillClose(notification:)), name: NSWindow.willCloseNotification, object: nil)
+
         V2rayLaunch.chmodCmdPermission()
 
         // backup system proxy when init
@@ -101,10 +178,12 @@ class MenuController: NSObject, NSMenuDelegate {
 
         statusItem.menu = statusMenu
 
-//        self.configWindow = ConfigWindowController()
-
-        // update config before 1.5.2
-        self.updateOldConfig()
+        // version before 1.5.2: res.rawValue is 0 or -1
+        let isOldConfigVersion = appVersion.compare("1.5.2", options: .numeric).rawValue > 0
+        print("isOldConfigVersion", isOldConfigVersion)
+        if !isOldConfigVersion {
+            regenerateAllConfig()
+        }
 
         if UserDefaults.getBool(forKey: .v2rayTurnOn) {
             // start
@@ -115,37 +194,13 @@ class MenuController: NSObject, NSMenuDelegate {
             self.setStatusOff()
         }
 
-        // windowWillClose Notification
-        NotificationCenter.default.addObserver(self, selector: #selector(configWindowWillClose(notification:)), name: NSWindow.willCloseNotification, object: nil)
+        // auto update subscribe servers
+        if UserDefaults.getBool(forKey: .autoUpdateServers) {
+            V2raySubSync().sync()
+        }
 
         // ping
-        self.pingAtLaunch()
-    }
-
-    func updateOldConfig() {
-        // version before 1.5.2: res.rawValue is 0 or -1
-//        let isOldConfigVersion = appVersion.compare("1.5.2", options: .numeric).rawValue > 0
-//        if !isOldConfigVersion {
-//            return
-//        }
-
-        for (idx, item) in V2rayServer.list().enumerated() {
-            if !item.isValid {
-                continue
-            }
-
-            let vCfg = V2rayConfig()
-            vCfg.parseJson(jsonText: item.json)
-            // reset empty data
-            vCfg.dns = ""
-            vCfg.routing.settings.rules = []
-            vCfg.routing.settings.domainStrategy = .AsIs
-            vCfg.v2ray.routing.settings.rules = []
-            vCfg.v2ray.routing.settings.domainStrategy = .AsIs
-
-            let text = vCfg.combineManual()
-            _ = V2rayServer.save(idx: idx, isValid: vCfg.isValid, jsonData: text)
-        }
+        PingSpeed().pingAll()
     }
 
     @IBAction func openLogs(_ sender: NSMenuItem) {
@@ -201,6 +256,10 @@ class MenuController: NSObject, NSMenuDelegate {
     // start v2ray core
     func startV2rayCore() {
         NSLog("start v2ray-core begin")
+        if !V2rayLaunch.checkPorts() {
+            setStatusOff()
+            return
+        }
 
         guard let v2ray = V2rayServer.loadSelectedItem() else {
             noticeTip(title: "start v2ray fail", subtitle: "", informativeText: "v2ray config not found")
@@ -231,14 +290,7 @@ class MenuController: NSObject, NSMenuDelegate {
     }
 
     @IBAction func start(_ sender: NSMenuItem) {
-        // turn off
-        if UserDefaults.getBool(forKey: .v2rayTurnOn) {
-            self.stopV2rayCore()
-            return
-        }
-
-        // start
-        self.startV2rayCore()
+        ToggleRunning(false)
     }
 
     @IBAction func quitClicked(_ sender: NSMenuItem) {
@@ -350,7 +402,7 @@ class MenuController: NSObject, NSMenuDelegate {
             }
 
             let menuItem: NSMenuItem = NSMenuItem()
-            menuItem.title = String(item.speed) + "ms\t    " + item.remark
+            menuItem.title = (item.speed.count > 0 ? item.speed : "-1ms") + "\t    " + item.remark
             menuItem.action = #selector(self.switchServer(_:))
             menuItem.representedObject = item
             menuItem.target = self
@@ -501,57 +553,15 @@ class MenuController: NSObject, NSMenuDelegate {
     }
 
     @IBAction func pingSpeed(_ sender: NSMenuItem) {
-        let normalTitle = sender.title
-        sender.title = "\(normalTitle) - In Testing"
-
-        let itemList = V2rayServer.list()
-        if itemList.count == 0 {
-            return
-        }
-
-        let queue = DispatchQueue.global()
-        queue.async {
-            for item in itemList {
-                if !item.isValid {
-                    continue
-                }
-
-                let ping = Ping(item: item)
-                ping.pingProxySpeed()
-            }
-            V2rayServer.saveItemList()
-
-            DispatchQueue.main.async {
-                sender.title = normalTitle
-                // refresh server
-                self.showServers()
-            }
-        }
+        PingSpeed().pingAll()
     }
 
-    func pingAtLaunch() {
-        let itemList = V2rayServer.list()
-        if itemList.count == 0 {
+    @IBAction func viewConfig(_ sender: Any) {
+        let confUrl = PACUrl.replacingOccurrences(of: "pac/proxy.js", with: "config.json")
+        guard let url = URL(string: confUrl) else {
             return
         }
-
-        let queue = DispatchQueue.global()
-        queue.async {
-            for item in itemList {
-                if !item.isValid {
-                    continue
-                }
-
-                let ping = Ping(item: item)
-                ping.pingProxySpeed()
-            }
-            V2rayServer.saveItemList()
-
-            DispatchQueue.main.async {
-                // refresh server
-                self.showServers()
-            }
-        }
+        NSWorkspace.shared.open(url)
     }
 
     func importUri(url: String) {
@@ -600,15 +610,6 @@ class MenuController: NSObject, NSMenuDelegate {
     }
 
     func noticeTip(title: String = "", subtitle: String = "", informativeText: String = "") {
-        // 定义NSUserNotification
-//        let userNotification = NSUserNotification()
-//        userNotification.title = title
-//        userNotification.subtitle = subtitle
-//        userNotification.informativeText = informativeText
-//        // 使用NSUserNotificationCenter发送NSUserNotification
-//        let userNotificationCenter = NSUserNotificationCenter.default
-//        userNotificationCenter.scheduleNotification(userNotification)
-
         makeToast(message: title + (subtitle.count > 0 ? " - " + subtitle : "") + " : " + informativeText)
     }
 }
